@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Dean William Woodside
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Bill's Pi setup orchestrator
+Wants=network-online.target
+#After=network-online.target
+After=network-online.target dhcpcd.service keyboard-setup.service getty.target userconfig.service
+ConditionPathExists=!/var/lib/billspi/setup.done
+
+[Service]
+Type=oneshot
+TimeoutStartSec=0
+SuccessExitStatus=200
+ExecStart=/usr/local/sbin/billspi-runner
+WorkingDirectory=/usr/local/lib/billspi
+StateDirectory=billspi
+Environment=DEBIAN_FRONTEND=noninteractive
+Environment=APT_LISTCHANGES_FRONTEND=none
+StandardOutput=journal+console
+StandardError=journal+console
+# Preserve bursts of installer output; other services retain their journal limits.
+LogRateLimitIntervalSec=0
+# Optional if you ever do unattended upgrades:
+# Environment=NEEDRESTART_MODE=a
+
+[Install]
+WantedBy=multi-user.target

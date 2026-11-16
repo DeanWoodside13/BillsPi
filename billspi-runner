@@ -1,0 +1,495 @@
+#!/bin/bash
+# Copyright (c) 2026 Dean William Woodside
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+
+readonly PHASEDIR="/usr/local/lib/billspi/phases"
+readonly STATEDIR="/var/lib/billspi"
+readonly STATEFILE="${STATEDIR}/current"
+readonly LOGTAG="billspi-runner"
+readonly LOGDIR="/var/log/billspi"
+readonly LOGFILE="${LOGDIR}/install.log"
+
+# One transcript writer per boot; the child keeps this guard across phase re-execs.
+# Preserve normal stdout/HDMI output and capture stderr without enabling shell tracing.
+if [[ "${BILLSPI_LOG_ACTIVE:-0}" != 1 ]]; then
+    [[ ! -L "$LOGDIR" ]] || { echo "ERROR: log directory is a symlink." >&2; exit 1; }
+    install -d -m0700 -o root -g root "$LOGDIR"
+    [[ ! -L "$LOGFILE" && ( ! -e "$LOGFILE" || -f "$LOGFILE" ) ]] \
+        || { echo "ERROR: unsafe installation log path." >&2; exit 1; }
+    (umask 077; : >> "$LOGFILE")
+    chown root:root "$LOGFILE"
+    chmod 0600 "$LOGFILE"
+
+    if BILLSPI_LOG_ACTIVE=1 /bin/bash "$0" "$@" 2>&1 | /usr/bin/tee --output-error=warn -a -- "$LOGFILE"; then
+        log_status=("${PIPESTATUS[@]}")
+    else
+        log_status=("${PIPESTATUS[@]}")
+    fi
+    rc=${log_status[0]}
+    if [[ ${log_status[1]} -ne 0 ]]; then
+        echo "ERROR: installation output capture failed; inspect disk space and the journal." >&2
+        [[ $rc -ne 0 && $rc -ne 200 ]] || rc=1
+    fi
+    if [[ $rc -ne 0 && $rc -ne 200 ]]; then
+        /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/sync || true
+        exit "$rc"
+    fi
+
+    # tee has drained: persist output before completion or an expected reboot.
+    /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/journalctl --sync
+    /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/sync
+    if [[ $rc -eq 200 ]]; then
+        systemctl reboot || reboot || shutdown -r now || true
+    else
+        install -D -m0644 /dev/null "${STATEDIR}/setup.done"
+        systemctl disable billspi-setup.service || true
+        /usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH /usr/bin/sync
+    fi
+    exit 0
+fi
+
+readonly BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+log_event() {
+    printf '[%s] [billspi] boot=%s %s\n' "$(/usr/bin/date -u '+%FT%TZ')" "$BOOT_ID" "$*"
+}
+trap 'rc=$?; log_event "RUNNER_ERROR line=${LINENO} phase=${next:-none} rc=${rc}" >&2; logger -t billspi "Runner failed: ${next:-none} rc=${rc}" || true; exit "$rc"' ERR
+log_event "RUNNER_START release=1.0.0.53"
+
+install -d -m0755 "$STATEDIR"
+[ -e "$STATEFILE" ] || : >"$STATEFILE"
+
+
+# Force deterministic, English CLI output for all phases (runner + children):
+# - avoids locale-dependent parsing surprises
+# - tiny speed win by skipping gettext/UTF-8 collation
+export LC_ALL=C LANG=C
+
+# Select by the complete filename: more than one phase can share a number.
+mapfile -t phases < <(find "${PHASEDIR}" -maxdepth 1 -type f -name '[0-9][0-9]-*.sh' -printf '%f\n' | sort -V)
+last_completed="$(cat "$STATEFILE")"
+next=""
+for f in "${phases[@]}"; do
+    if [[ -z "$last_completed" ]]; then
+        next="${PHASEDIR}/${f}"
+        phase_num="${f:0:2}"
+        break
+    fi
+    if [[ "$f" == "$last_completed" ]]; then
+        last_completed=""
+    fi
+done
+
+# Finish before recreating provisioning mounts or wrappers after cleanup.
+if [[ -z "$next" ]]; then
+    # End provisioning autologin and require authentication on tty1.
+    rm -f -- /etc/systemd/system/getty@tty1.service.d/autologin.conf \
+        /etc/systemd/system/getty@tty1.service.d/override.conf
+    systemctl daemon-reload
+    systemctl restart getty@tty1.service
+    log_event "INSTALL_COMPLETE all phases finished; synchronizing logs before setup.done."
+    logger -t "$LOGTAG" "All phases complete. Disabling billspi-setup.service."
+    exit 0
+fi
+# Optional safety checks (cheap and harmless):
+command -v raspi-config >/dev/null 2>&1 || logger -t "$LOGTAG" "raspi-config not found; will skip keyboard/autologin."
+command -v systemctl >/dev/null 2>&1 || logger -t "$LOGTAG" "systemctl not found; will skip service restarts."
+
+
+# Prevent the messages on terminal: "Wi-Fi is currently blocked by rfkill" and "Use raspi-config to set the country before use"
+# ---- Wi-Fi country + rfkill (run once) ----
+if [ ! -e "${STATEDIR}/wifi_country.done" ]; then
+  if command -v raspi-config >/dev/null 2>&1; then
+    # WIFI_CC="${WIFI_CC:-US}"  # let PrepBill set this if you like
+    # echo "[billspi] Setting Wi-Fi country to ${WIFI_CC} via raspi-config..."
+    # logger -t "$LOGTAG" "Setting Wi-Fi country to ${WIFI_CC}"
+    # raspi-config nonint do_wifi_country "${WIFI_CC}" || true
+
+    raspi-config nonint do_wifi_country US
+
+    # Unblock Wi-Fi and bounce the right stack
+    if command -v rfkill >/dev/null 2>&1; then
+      rfkill unblock wlan || true
+    fi
+    
+    if systemctl is-active --quiet NetworkManager; then
+      systemctl try-restart NetworkManager || true
+    else
+      systemctl try-restart wpa_supplicant || true
+      systemctl try-restart dhcpcd || true
+    fi
+
+    install -D -m0644 /dev/null "${STATEDIR}/wifi_country.done"
+  else
+    echo "[billspi] raspi-config not found; skipping Wi-Fi country setup."
+    logger -t "$LOGTAG" "raspi-config not found; skipping Wi-Fi country setup."
+  fi
+fi
+
+# ---- keyboard + autologin (run once) ----
+if [ ! -e "${STATEDIR}/autologin_keyboard.done" ]; then
+  if command -v raspi-config >/dev/null 2>&1; then
+    echo "[billspi] Setting keyboard to US via raspi-config..."
+    logger -t "$LOGTAG" "Setting keyboard to US via raspi-config..."
+    raspi-config nonint do_configure_keyboard us || true
+
+    systemctl try-restart keyboard-setup.service >/dev/null 2>&1 || true
+    command -v setupcon >/dev/null && setupcon -k || true
+
+    echo "[billspi] Enabling console auto-login via raspi-config..."
+    logger -t "$LOGTAG" "Enabling console auto-login via raspi-config..."
+#    raspi-config nonint do_boot_behaviour B2 || true
+#    systemctl try-restart getty@tty1.service >/dev/null 2>&1 || true
+#    install -D -m0644 /dev/null "${STATEDIR}/autologin_keyboard.done"
+raspi-config nonint do_boot_behaviour B2 || true
+
+    # Ensure the autologin targets the actual primary user (uid 1000), not hard-coded "pi"
+    AUTOLOGIN_USER="$(awk -F: '$3==1000{print $1; exit}' /etc/passwd)"
+    install -d -m 0755 "/etc/systemd/system/getty@tty1.service.d"
+    cat >"/etc/systemd/system/getty@tty1.service.d"/override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${AUTOLOGIN_USER} --noclear %I \$TERM
+EOF
+    systemctl daemon-reload
+
+    # Start the actual unit after installing its autologin override.
+    systemctl restart getty@tty1.service >/dev/null 2>&1 || true
+
+    install -D -m0644 /dev/null "${STATEDIR}/autologin_keyboard.done"
+
+
+  else
+    echo "[billspi] raspi-config not found; skipping keyboard/autologin setup."
+    logger -t "$LOGTAG" "raspi-config not found; skipping keyboard/autologin setup."
+  fi
+fi
+
+
+#case ":$PATH:" in
+#  *:/usr/local/sbin:*) ;;
+#  *) export PATH="/usr/local/sbin:/usr/local/bin:$PATH" ;;
+#esac
+
+## Ensure /usr/local/sbin and /usr/local/bin are in PATH without creating duplicates
+#case ":$PATH:" in
+#  *:/usr/local/sbin:*:/usr/local/bin:*) ;;             # both present
+#  *:/usr/local/sbin:*) PATH="/usr/local/bin:$PATH" ;;  # add bin only
+#  *:/usr/local/bin:*) PATH="/usr/local/sbin:$PATH" ;;  # add sbin only
+#  *) PATH="/usr/local/sbin:/usr/local/bin:$PATH" ;;    # add both
+#esac
+#export PATH
+
+# Ensure /usr/local/sbin and /usr/local/bin come first, without duplicates
+PATH="/usr/local/sbin:/usr/local/bin${PATH:+:$PATH}"
+if command -v awk >/dev/null 2>&1; then
+  PATH="$(printf '%s' "$PATH" | awk -v RS=: '
+    length($0) && !seen[$0]++ {
+      if (out) out = out ":" $0; else out = $0
+    }
+    END { print out }
+  ')"
+fi
+export PATH
+
+
+# Export noninteractive environment variables once in the runner
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export APT_LISTCHANGES_FRONTEND=none
+# Optional helper for phases that want a single var:
+export APT_ARGS='-y -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-unsafe-io -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=3 -o DPkg::Lock::Timeout=600'
+
+
+# Build parallelism for DKMS and any package builds that honor DEB_BUILD_OPTIONS
+JOBS="$(nproc 2>/dev/null || echo 2)"
+
+# Ensure our -j is the last flag so it takes precedence
+export MAKEFLAGS="${MAKEFLAGS:+$MAKEFLAGS }-j${JOBS}"
+
+# Replace any existing parallel:N token, normalize spaces, then append ours
+if [ -n "${DEB_BUILD_OPTIONS:-}" ]; then
+  DEB_BUILD_OPTIONS="$(printf '%s' "$DEB_BUILD_OPTIONS" \
+    | sed -E 's/(^|[[:space:]])parallel:[0-9]+([[:space:]]|$)/ /g; s/[[:space:]]+/ /g; s/^[[:space:]]+|[[:space:]]+$//g')"
+  DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:+$DEB_BUILD_OPTIONS }parallel:${JOBS}"
+else
+  DEB_BUILD_OPTIONS="parallel:${JOBS}"
+fi
+export DEB_BUILD_OPTIONS
+
+
+# Prefer IPv4 if IPv6 isn't usable (avoid AAAA/connect stalls on v4-only or broken v6 nets)
+# 1) Decide if IPv6 is really usable: needs default route AND a quick successful HTTPS HEAD.
+has_ipv6_usable() {
+  ip -6 route show default >/dev/null 2>&1 || return 1
+  # Try a fast IPv6 HEAD; call the system curl explicitly (pre-wrapper)
+  if command -v /usr/bin/curl >/dev/null 2>&1; then
+    /usr/bin/curl -6 -Is --max-time 2 https://deb.debian.org/ >/dev/null 2>&1
+  else
+    # If curl isn't present yet, don't block IPv6 just on that basis-assume usable.
+    return 0
+  fi
+}
+
+## Ensure /usr/local/bin is early in PATH so our wrapper is respected everywhere
+#case ":$PATH:" in *:/usr/local/bin:*) ;; *) export PATH="/usr/local/bin:$PATH" ;; esac
+
+if ! has_ipv6_usable; then
+  # APT: Force IPv4
+  install -D -m0644 /dev/stdin /etc/apt/apt.conf.d/03forceipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
+
+  # curl: tiny wrapper that forces -4 (keeps exit codes and behavior)
+  if command -v curl >/dev/null 2>&1; then
+#    # Record the real curl target only once
+#    if [ ! -e /usr/local/bin/curl.orig ]; then
+#      REAL="$(command -v curl)"; ln -sf "$REAL" /usr/local/bin/curl.orig
+#    fi
+#    install -D -m0755 /dev/stdin /usr/local/bin/curl <<'EOF'
+##!/bin/sh
+#exec /usr/local/bin/curl.orig -4 "$@"
+#EOF
+
+# Resolve the system curl explicitly; bail out if missing
+if [ -x /usr/bin/curl ]; then
+  ln -sf -- "/usr/bin/curl" "/usr/local/bin/curl.orig"
+  install -D -m0755 /dev/stdin "/usr/local/bin/curl" <<'EOF'
+#!/bin/sh
+exec /usr/local/bin/curl.orig -4 "$@"
+EOF
+else
+  printf >&2 'fatal: /usr/bin/curl not found; please apt-get install curl first\n'
+  exit 1
+fi
+
+  fi
+else
+  # Dual-stack / working IPv6: remove any temporary overrides (harmless if absent)
+  rm -f /etc/apt/apt.conf.d/03forceipv4
+  rm -f /usr/local/bin/curl /usr/local/bin/curl.orig
+fi
+
+
+
+# --- Network readiness helpers (centralized) ---
+
+# Helper: default route?
+have_route() {
+  ip -4 route show default >/dev/null 2>&1 || ip -6 route show default >/dev/null 2>&1
+}
+
+# Helper: quick HTTPS HEAD via the real curl (avoid any wrapper)
+head_ok() {
+  command -v /usr/bin/curl >/dev/null 2>&1 && /usr/bin/curl -fsSI --max-time 2 https://deb.debian.org/ >/dev/null 2>&1
+}
+
+# Wait for usable network (bounded). Always returns 0 (non-blocking for callers).
+wait_net() {
+  # Fast path
+  if have_route && head_ok; then return 0; fi
+
+  # Prefer distro tools
+  if command -v nm-online >/dev/null 2>&1; then
+    nm-online -q --timeout=25 || true
+  elif command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -w -t 25 || true
+  else
+    # Bounded fallback loop (<=25s)
+    for _ in $(seq 1 25); do
+      have_route || { sleep 1; continue; }
+      head_ok && break
+      sleep 1
+    done
+  fi
+
+  return 0
+}
+
+# Cache the check (default TTL 120s) to avoid repeated probes on non-network phases
+wait_net_if_needed() {
+  [ -n "${BILLSPI_SKIP_WAIT_NET:-}" ] && return 0  # global escape hatch
+  install -d -m0755 /run/billspi
+  TTL=${BILLSPI_WAIT_NET_TTL:-120}
+
+  # Invalidate cache if current network isn’t actually OK
+  if ! have_route || ! head_ok; then
+    rm -f /run/billspi/net-ok.stamp
+  fi
+
+  if [ -f /run/billspi/net-ok.stamp ]; then
+    last=$(sed -n '1p' /run/billspi/net-ok.stamp 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if [ $((now - last)) -lt "$TTL" ]; then
+      return 0
+    fi
+  fi
+
+  wait_net
+
+  # Only stamp when connectivity is actually OK
+  if have_route && head_ok; then
+    date +%s > /run/billspi/net-ok.stamp
+  fi
+}
+
+
+# Mount /tmp on tmpfs for this run (only if not already)
+if ! mountpoint -q /tmp; then
+  mount -t tmpfs -o mode=1777,nosuid,nodev,size=50% tmpfs /tmp
+  install -D -m0644 /dev/null /var/lib/billspi/tmpfs-tmp.stamp
+fi
+
+# Mount /var/tmp on tmpfs during provisioning
+if ! mountpoint -q /var/tmp; then
+  mount -t tmpfs -o mode=1777,nosuid,nodev,size=50% tmpfs /var/tmp
+  install -D -m0644 /dev/null /var/lib/billspi/tmpfs-vartmp.stamp
+fi
+
+# Ensure APT lists live on tmpfs during provisioning (idempotent)
+ensure_apt_lists_tmpfs() {
+  # Allow override via env; otherwise size based on RAM tiers
+  if [ -n "${BILLSPI_APT_LISTS_TMPFS_SIZE_MB:-}" ]; then
+    TMPFS_SIZE_MB="$BILLSPI_APT_LISTS_TMPFS_SIZE_MB"
+  else
+    TOTAL_MEM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    if   [ "$TOTAL_MEM_KB" -ge 15000000 ]; then TMPFS_SIZE_MB=512   # ~16GB RAM
+    elif [ "$TOTAL_MEM_KB" -ge  7500000 ]; then TMPFS_SIZE_MB=384   # ~8GB RAM
+    elif [ "$TOTAL_MEM_KB" -ge  3500000 ]; then TMPFS_SIZE_MB=256   # ~4GB RAM
+    else                                      TMPFS_SIZE_MB=192   # ~2GB RAM
+    fi
+  fi
+
+  # redundant
+  # install -d -m 0700 /var/lib/apt/lists/partial
+
+
+  if ! mountpoint -q /var/lib/apt/lists; then
+    # Not mounted yet - mount tmpfs with our cap
+    mount -t tmpfs -o "size=${TMPFS_SIZE_MB}M,mode=0755,nodev,nosuid,noexec" tmpfs /var/lib/apt/lists
+  else
+    # Already a mountpoint; if it's tmpfs, optionally bump size (idempotent)
+    if [ "$(findmnt -n -o FSTYPE /var/lib/apt/lists)" = "tmpfs" ]; then
+      mount -o "remount,size=${TMPFS_SIZE_MB}M,mode=0755,nodev,nosuid,noexec" /var/lib/apt/lists || true
+    else
+      echo "WARN: /var/lib/apt/lists is mounted but not tmpfs; continuing on disk." >&2
+    fi
+  fi
+
+  install -d -m 0700 /var/lib/apt/lists/partial
+}
+
+
+mkdir -p "$STATEDIR"
+touch "$STATEFILE"
+# Bounded connectivity warm-up (max ~10s); exits immediately once reachable.  Run warm-up only if no default route yet
+# /bin/sh -lc '[ -n "$(ip -4 route show default 2>/dev/null)" ] || { for d in 1 2 3 5; do curl -fsSI --max-time 1 https://deb.debian.org >/dev/null && exit 0; sleep $d; done; exit 0; }' || true
+# /bin/sh -lc 'if ! ip -4 route show default >/dev/null 2>&1 && ! ip -6 route show default >/devnull 2>&1; then for d in 1 2 3 5; do (ip -4 route show default >/dev/null 2>&1 || ip -6 route show default >/dev/null 2>&1) || { sleep $d; continue; }; /usr/bin/curl -fsSI --max-time 1 https://deb.debian.org >/dev/null 2>&1 && exit 0; sleep $d; done; fi; exit 0' || true
+/bin/sh -lc 'if ! ip -4 route show default >/dev/null 2>&1 && ! ip -6 route show default >/dev/null 2>&1; then for d in 1 2 3 5; do (ip -4 route show default >/dev/null 2>&1 || ip -6 route show default >/dev/null 2>&1) || { sleep $d; continue; }; /usr/bin/curl -fsSI --max-time 1 https://deb.debian.org >/dev/null 2>&1 && exit 0; sleep $d; done; fi; exit 0' || true
+
+
+
+## Run the selected phase (wait for usable network first, cached)
+#if [[ -n "$next" ]]; then
+#    type wait_net_if_needed >/dev/null 2>&1 && wait_net_if_needed
+#    bash "$next"   # or: sh "$next" / "$next" - match whatever you use to run phases
+#fi
+
+
+
+
+
+
+## --- One-time console autologin + US keyboard setup (safe if repeated) ---
+#if [ ! -e "${STATEDIR}/autologin_keyboard.done" ]; then
+#  if command -v raspi-config >/dev/null 2>&1; then
+#    echo "[billspi] Setting keyboard to US via raspi-config..."
+#    logger -t "$LOGTAG" "Setting keyboard to US via raspi-config..."
+#    raspi-config nonint do_configure_keyboard us || true
+#
+#    # Apply keyboard settings immediately on the console
+#    systemctl restart keyboard-setup.service || true
+#    command -v setupcon >/dev/null && setupcon -k || true
+#
+#    echo "[billspi] Enabling console auto-login via raspi-config..."
+#    logger -t "$LOGTAG" "Enabling console auto-login via raspi-config..."
+#    raspi-config nonint do_boot_behaviour B2 || true
+#
+#    # Optional: apply autologin immediately without reboot
+#    systemctl restart getty@tty1.service || true
+#
+#    # Stamp completion so this block only runs once ever
+#    install -D -m0644 /dev/null "${STATEDIR}/autologin_keyboard.done"
+#  else
+#    echo "[billspi] raspi-config not found; skipping keyboard/autologin setup."
+#    logger -t "$LOGTAG" "raspi-config not found; skipping keyboard/autologin setup."
+#  fi
+#fi
+
+
+
+
+# Keep downloaded packages on disk across installation reboots.
+install -d -m 0755 /var/cache/apt/archives
+install -d -m 0700 /var/cache/apt/archives/partial
+ensure_apt_lists_tmpfs
+type wait_net_if_needed >/dev/null 2>&1 && wait_net_if_needed
+
+log_event "PHASE_PREPARE phase=${next##*/}"
+logger -t "$LOGTAG" "Starting phase ${phase_num}: ${next}"
+chmod +x "$next" || true
+
+# [ -e /usr/lib/aarch64-linux-gnu/libeatmydata.so ] && export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libeatmydata.so
+# Ensure eatmydata is preloaded if it became available earlier this boot
+unset LD_PRELOAD || true
+for p in /usr/lib/aarch64-linux-gnu/libeatmydata.so /usr/lib/arm-linux-gnueabihf/libeatmydata.so /usr/lib/libeatmydata.so; do
+  if [ -r "$p" ]; then
+    export LD_PRELOAD="$p"
+    break
+  fi
+done
+
+## Run the phase and capture rc without triggering ERR trap
+#if ! systemd-cat -t "$LOGTAG" -- "$next"; then
+#    rc=$?
+#else
+#    rc=0
+#fi
+
+# Run the phase only if one is pending
+if [[ -z "${next:-}" ]]; then
+   logger -t "$LOGTAG" "All phases complete."
+   exit 0
+fi
+type wait_net_if_needed >/dev/null 2>&1 && wait_net_if_needed
+read -r phase_started _ < /proc/uptime
+log_event "PHASE_START phase=${next##*/} uptime_seconds=${phase_started}"
+if /bin/bash "$next"; then
+  rc=0
+else
+  rc=$?
+fi
+read -r phase_ended _ < /proc/uptime
+phase_duration="$(/usr/bin/awk -v start="$phase_started" -v end="$phase_ended" 'BEGIN {printf "%.2f", end-start}')"
+log_event "PHASE_END phase=${next##*/} rc=${rc} duration_seconds=${phase_duration}"
+if [[ "$rc" -ne 0 && "$rc" -ne 200 ]]; then
+  echo "[billspi] Phase ${phase_num} failed with exit ${rc}: ${next}" >&2
+  logger -t "$LOGTAG" "Phase ${phase_num} failed: ${next} rc=${rc}"
+  exit "$rc"
+fi
+
+# Reboot markers
+if [[ -f /run/reboot-required || -f /run/billspi/reboot-required || $rc -eq 200 ]]; then
+    printf '%s\n' "${next##*/}" > "$STATEFILE"    # mark this phase completed
+    log_event "REBOOT_REQUEST phase=${next##*/} rc=${rc}; drain and synchronize logs before reboot."
+    logger -t "$LOGTAG" "Reboot requested by phase ${phase_num}; rebooting."
+    exit 200
+fi
+
+# Phase finished normally: advance state to this completed phase
+log_event "PHASE_COMPLETE phase=${next##*/}"
+logger -t "$LOGTAG" "Phase ${phase_num} completed."
+printf '%s\n' "${next##*/}" > "$STATEFILE"
+
+# Continue to the next phase in the same boot: re-exec the runner (no extra processes).
+exec "$0"
